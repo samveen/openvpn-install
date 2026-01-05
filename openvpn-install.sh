@@ -2643,19 +2643,23 @@ function installOpenVPN() {
 		log_info "Installing OpenVPN and dependencies..."
 		# socat is used for communicating with the OpenVPN management interface (client disconnect on revoke)
 		if [[ $OS =~ (debian|ubuntu) ]]; then
-			run_cmd_fatal "Installing OpenVPN" apt-get install -y openvpn iptables openssl curl ca-certificates tar dnsutils socat
+			run_cmd_fatal "Installing OpenVPN" apt-get install -y openvpn iptables openssl curl ca-certificates tar dnsutils socat libpam-google-authenticator libpam-pwdfile qrencode
 		elif [[ $OS == 'centos' ]]; then
-			run_cmd_fatal "Installing OpenVPN" yum install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat 'policycoreutils-python*'
+			run_cmd_fatal "Installing OpenVPN" yum install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat 'policycoreutils-python*' google-authenticator qrencode
+			run_cmd "Attempting to install pam_pwdfile" yum install -y pam_pwdfile
 		elif [[ $OS == 'oracle' ]]; then
-			run_cmd_fatal "Installing OpenVPN" yum install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat policycoreutils-python-utils
+			run_cmd_fatal "Installing OpenVPN" yum install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat policycoreutils-python-utils google-authenticator qrencode
+			run_cmd "Attempting to install pam_pwdfile" yum install -y pam_pwdfile
 		elif [[ $OS == 'amzn2023' ]]; then
-			run_cmd_fatal "Installing OpenVPN" dnf install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat
+			run_cmd_fatal "Installing OpenVPN" dnf install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat google-authenticator qrencode
+			run_cmd "Attempting to install pam_pwdfile" dnf install -y pam_pwdfile
 		elif [[ $OS == 'fedora' ]]; then
-			run_cmd_fatal "Installing OpenVPN" dnf install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat policycoreutils-python-utils
+			run_cmd_fatal "Installing OpenVPN" dnf install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat policycoreutils-python-utils google-authenticator qrencode
+			run_cmd "Attempting to install pam_pwdfile" dnf install -y pam_pwdfile
 		elif [[ $OS == 'opensuse' ]]; then
-			run_cmd_fatal "Installing OpenVPN" zypper install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat
+			run_cmd_fatal "Installing OpenVPN" zypper install -y openvpn iptables openssl ca-certificates curl tar bind-utils socat google-authenticator-libpam pam_pwdfile qrencode
 		elif [[ $OS == 'arch' ]]; then
-			run_cmd_fatal "Installing OpenVPN" pacman --needed --noconfirm -Syu openvpn iptables openssl ca-certificates curl tar bind socat
+			run_cmd_fatal "Installing OpenVPN" pacman --needed --noconfirm -Syu openvpn iptables openssl ca-certificates curl tar bind socat libpam-google-authenticator libpam_pwdfile qrencode
 		fi
 
 		# Verify ChaCha20-Poly1305 compatibility if selected
@@ -2839,14 +2843,18 @@ function installOpenVPN() {
 		echo "user $OPENVPN_USER
 group $OPENVPN_GROUP" >>/etc/openvpn/server/server.conf
 	fi
-	echo "persist-key
+
+	cat <<ENDL  >>/etc/openvpn/server/server.conf
+plugin openvpn-plugin-auth-pam.so openvpn
+verify-client-cert none
+username-as-common-name
+persist-key
 persist-tun
 keepalive 10 120
-topology subnet" >>/etc/openvpn/server/server.conf
+topology subnet
+server $VPN_SUBNET_IPV4 255.255.255.0
+ENDL
 
-	# IPv4 server directive - always assign IPv4 to clients for proper routing
-	# Even for IPv6-only mode, we need IPv4 addresses so redirect-gateway def1 can block IPv4 leaks
-	echo "server $VPN_SUBNET_IPV4 255.255.255.0" >>/etc/openvpn/server/server.conf
 
 	# IPv6 server directive (only if clients get IPv6)
 	if [[ $CLIENT_IPV6 == "y" ]]; then
@@ -3061,6 +3069,55 @@ verb 3"
 	run_cmd_fatal "Creating client config directory" mkdir -p /etc/openvpn/server/ccd
 	# Create log dir
 	run_cmd_fatal "Creating log directory" mkdir -p /var/log/openvpn
+
+	# Create directories for virtual users and Google Authenticator
+	run_cmd_fatal "Creating virtual users directory" mkdir -p /etc/openvpn/server/users
+	run_cmd_fatal "Creating Google Authenticator directory" mkdir -p /etc/openvpn/server/google-auth
+	run_cmd_fatal "Creating scripts directory" mkdir -p /etc/openvpn/server/scripts
+	run_cmd "Touching passwd file" touch /etc/openvpn/server/users/passwd
+	run_cmd "Setting permissions on passwd" chmod 600 /etc/openvpn/server/users/passwd
+
+	# Create portable PAM authentication script as a fallback
+	cat <<'EOF' >/etc/openvpn/server/scripts/ovpn-pam-auth.sh
+#!/bin/bash
+# Read password from stdin
+read -r PASSWORD
+PASSWD_FILE="/etc/openvpn/server/users/passwd"
+[[ -f "$PASSWD_FILE" ]] || exit 1
+USER_LINE=$(grep "^${PAM_USER}:" "$PASSWD_FILE")
+[[ -n "$USER_LINE" ]] || exit 1
+STORED_HASH=$(echo "$USER_LINE" | cut -d':' -f2-)
+ALGO_ID=$(echo "$STORED_HASH" | cut -d'$' -f2)
+SALT=$(echo "$STORED_HASH" | cut -d'$' -f3)
+case "$ALGO_ID" in
+    1) FLAG="-1" ;;
+    5) FLAG="-5" ;;
+    6) FLAG="-6" ;;
+    *) exit 1 ;;
+esac
+NEW_HASH=$(openssl passwd "$FLAG" -salt "$SALT" "$PASSWORD")
+[[ "$NEW_HASH" == "$STORED_HASH" ]] && exit 0 || exit 1
+EOF
+	chmod 700 /etc/openvpn/server/scripts/ovpn-pam-auth.sh
+
+	# Create PAM configuration for OpenVPN
+	log_info "Creating PAM configuration for OpenVPN..."
+	# Detect if pam_pwdfile.so is present, otherwise use pam_exec fallback
+	if [[ -f /lib/x86_64-linux-gnu/security/pam_pwdfile.so ]] || [[ -f /lib64/security/pam_pwdfile.so ]] || [[ -f /usr/lib/security/pam_pwdfile.so ]] || [[ -f /usr/lib64/security/pam_pwdfile.so ]]; then
+		{
+			echo "# PAM configuration for OpenVPN (using pam_pwdfile)"
+			echo "auth    required    pam_pwdfile.so pwdfile=/etc/openvpn/server/users/passwd"
+			echo "auth    required    pam_google_authenticator.so secret=/etc/openvpn/server/google-auth/\${USER} user=root"
+			echo "account [success=ok ignore=ignore default=bad] pam_permit.so"
+		} >/etc/pam.d/openvpn
+	else
+		{
+			echo "# PAM configuration for OpenVPN (using fallback pam_exec)"
+			echo "auth    [success=done new_authtok_reqd=done default=die] pam_exec.so expose_authtok /etc/openvpn/server/scripts/ovpn-pam-auth.sh"
+			echo "auth    required    pam_google_authenticator.so secret=/etc/openvpn/server/google-auth/\${USER} user=root"
+			echo "account [success=ok ignore=ignore default=bad] pam_permit.so"
+		} >/etc/pam.d/openvpn
+	fi
 
 	# On distros that use a dedicated OpenVPN user (not "nobody"), e.g., Fedora, RHEL, Arch,
 	# set ownership so OpenVPN can read config/certs and write to log directory
@@ -4043,8 +4100,41 @@ $CLIENT_FINGERPRINT
 	# Write the .ovpn config file with proper path and permissions
 	writeClientConfig "$CLIENT"
 
+	# Virtual User / 2FA Setup
+	log_info "Setting up virtual user and 2FA for $CLIENT..."
+	local client_pw
+	client_pw=$(openssl rand -base64 12)
+	local hashed_pw
+	hashed_pw=$(openssl passwd -6 "$client_pw")
+	echo "$CLIENT:$hashed_pw" >>/etc/openvpn/server/users/passwd
+
+	# Generate Google Authenticator secret
+	run_cmd "Generating Google Authenticator secret" google-authenticator -t -d -f -r 3 -R 30 -W -s "/etc/openvpn/server/google-auth/$CLIENT"
+
+	# Fix ownership so OpenVPN can read it
+	chown "$OPENVPN_USER:$OPENVPN_GROUP" "/etc/openvpn/server/google-auth/$CLIENT"
+	chown "$OPENVPN_USER:$OPENVPN_GROUP" /etc/openvpn/server/users/passwd
+
+	local ga_secret
+	ga_secret=$(head -n 1 "/etc/openvpn/server/google-auth/$CLIENT")
+	local qr_code_path="/etc/openvpn/server/google-auth/$CLIENT.png"
+	local otp_uri="otpauth://totp/$CLIENT@$(hostname)?secret=$ga_secret&issuer=OpenVPN"
+	run_cmd "Generating QR code" qrencode -t PNG -o "$qr_code_path" "$otp_uri"
+	chown "$OPENVPN_USER:$OPENVPN_GROUP" "$qr_code_path"
+
+	# Append 2FA and static challenge to .ovpn
+	{
+		echo 'static-challenge "Enter OTP: " 1'
+		echo 'auth-user-pass'
+	} >>"$GENERATED_CONFIG_PATH"
+
 	log_menu ""
 	log_success "The configuration file has been written to $GENERATED_CONFIG_PATH."
+	log_success "Virtual user created. Credentials:"
+	log_info "  Username: $CLIENT"
+	log_info "  Password: $client_pw"
+	log_info "  QR Code: $qr_code_path"
+	log_info "  OTP URI: $otp_uri"
 	log_info "Download the .ovpn file and import it in your OpenVPN client."
 }
 
@@ -4087,10 +4177,16 @@ function revokeClient() {
 	run_cmd "Removing client config from /root" rm -f "/root/$CLIENT.ovpn"
 	run_cmd "Removing IP assignment" sed -i "/^$CLIENT,.*/d" /etc/openvpn/server/ipp.txt
 
+	# Remove virtual user creds and GA secret
+	log_info "Removing virtual user credentials and 2FA data for $CLIENT..."
+	run_cmd "Removing user from passwd" sed -i "/^$CLIENT:.*/d" /etc/openvpn/server/users/passwd
+	run_cmd "Removing GA secret" rm -f "/etc/openvpn/server/google-auth/$CLIENT"
+	run_cmd "Removing GA QR code" rm -f "/etc/openvpn/server/google-auth/$CLIENT.png"
+
 	# Disconnect the client if currently connected
 	disconnectClient "$CLIENT"
 
-	log_success "Certificate for client $CLIENT revoked."
+	log_success "Certificate and virtual user for client $CLIENT revoked."
 }
 
 # Disconnect a client via the management interface
